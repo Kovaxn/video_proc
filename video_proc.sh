@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+
+# (Universal) video remastering script: crops video to center and scales to target width
+# Source: https://github.com/Kovaxn/video_proc/
+#
+# Usage: ./video_proc.sh file1.mp4 file2.mp4 "File 014.1.mp4" ...
+#   Single file:
+#   ./video_proc.sh "File 010.mp4"
+#
+#   Multiple files:
+#   ./video_proc.sh File\ 010.1.mp4 File\ 010.2.mp4 File\ 011.mp4
+#
+#   All files by pattern:
+#   ./video_proc.sh File*.mp4
+#   ./video_proc.sh "File 010."*.mp4
+#
+#   File 10 to 13:
+#   ./video_proc.sh File\ 01{0..3}.mp4
+#######################################
+
+# Enable safer script execution:
+#   -u - treat unset variables as an error (prevents typos like $myvar vs $myvarr)
+#   -o - pipefail, make pipelines fail if any command in the pipe fails (not just the last one)
+# Note: -e (errexit) is intentionally omitted to allow partial success when processing multiple files
+set -uo pipefail
+
+# Handle interruption (Ctrl+C) gracefully
+cleanup_on_exit() {
+    echo
+    log_message WARNING "DEBUG: CURRENT_OUTPUT='$CURRENT_OUTPUT'"
+    
+    # Shutting down the proc to avoid recursion
+    trap - SIGINT SIGTERM
+
+    # Time to ffmpeg correct exit on interrupt
+    log_message WARNING "Processing interrupted. Waiting for ffmpeg to finish..."
+    sleep 2
+
+    # Remove incomplete file if any
+    if [[ -n "$CURRENT_OUTPUT" && -f "$CURRENT_OUTPUT" ]]; then
+        rm -f "$CURRENT_OUTPUT" 2>/dev/null
+        log_message WARNING "Incomplete output file removed: $CURRENT_OUTPUT"
+    fi
+
+    if [[ $processed -gt 0 ]]; then
+        log_message WARNING "Processing interrupted by user. Successfully processed: $processed out of $total_files"
+    else
+        log_message WARNING "Processing interrupted by user. No files were processed."
+    fi
+    exit 130
+}
+
+# Set up signal traps
+trap cleanup_on_exit SIGINT SIGTERM
+
+
+#######################################
+# DEFAULT PARAMETERS
+#######################################
+VERSION="1.0"
+ASPECT="source"
+SCALE=960
+CRF=28
+PRESET="slow"
+NOTIFY=true
+OVERWRITE=false
+OUTPUT_DIR="_remaster"
+DRY_RUN=false
+SCRIPT_NAME="${0##*/}"
+LOG_FILE=""
+
+#######################################
+# HELP FUNCTION
+#######################################
+show_help() {
+    cat <<EOF
+Usage: $0 [OPTIONS] input1.mp4 [input2.mp4 ...]
+
+Options:
+  --aspect RATIO      Target aspect ratio (e.g. 4:3, 16:9). Default: source
+  --scale WIDTH       Target output width. Height is calculated proportionally. Default: 960
+  --crf VALUE         CRF quality (H.265). Lower = better quality. Default: 28
+  --preset NAME       x265 preset (ultrafast, fast, medium, slow, veryslow). Default: slow
+  --notify            Enable desktop notifications (default)
+  --no-notify         Disable desktop notifications
+  --overwrite         Overwrite output files if they exist
+  --output-dir DIR    Directory to save processed files. Default: _remaster
+  --dry-run           Only calculate filter parameters, do not encode
+  --log [FILE]        Enable logging. If FILE is not provided, auto-generates a log file in current directory.
+  --version           Show version and exit
+  --help              Show this help message and exit
+
+Examples:
+  $0 File*.mp4
+  $0 --aspect 4:3 --scale 720 "File 010.mp4" "File 011.mp4"
+  $0 --no-notify --overwrite File_010.mp4
+EOF
+    exit 0
+}
+
+#######################################
+# CHECK DEPENDENCIES
+#######################################
+check_dependencies() {
+    local missing=()
+    for cmd in ffmpeg ffprobe gawk; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+    if (( ${#missing[@]} > 0 )); then
+        echo "Error: missing required dependencies: ${missing[*]}" >&2
+        echo "Please install them and try again." >&2
+        exit 1
+    fi
+}
+
+#######################################
+# PARSE OPTIONS
+#######################################
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help) show_help ;;
+        --aspect) ASPECT="$2"; shift 2 ;;
+        --scale) SCALE="$2"; shift 2 ;;
+        --crf) CRF="$2"; shift 2 ;;
+        --preset) PRESET="$2"; shift 2 ;;
+        --notify) NOTIFY=true; shift ;;
+        --no-notify) NOTIFY=false; shift ;;
+        --overwrite) OVERWRITE=true; shift ;;
+        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --log)
+            if [[ $# -gt 1 && "$2" != --* ]]; then
+                LOG_FILE="$2"
+                shift 2
+            else
+                # Auto-generate log filename
+                LOG_FILE="video_proc_$(date +%Y%m%d_%H%M%S).log"
+                shift
+            fi
+            ;;
+        --version)
+            echo "$SCRIPT_NAME v$VERSION"
+            exit 0
+            ;;
+        -*|--*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+set -- "${POSITIONAL[@]}"
+
+if [[ $# -eq 0 ]]; then
+    echo "Error: please specify at least one video file" >&2
+    echo "Use --help for usage instructions" >&2
+    exit 1
+fi
+
+#######################################
+# CHECK NOTIFY
+#######################################
+if ! command -v notify-send >/dev/null 2>&1; then
+    NOTIFY=false
+fi
+
+# Check required tools before proceeding
+check_dependencies
+
+# Logging function
+log_message() {
+    local level="$1"
+    shift
+    local msg="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    if [[ -n "$LOG_FILE" ]]; then
+        printf "[%s] %s: %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE"
+    fi
+
+    case "$level" in
+        ERROR|WARNING)
+            echo "$msg" >&2
+            ;;
+        *)
+            echo "$msg"
+            ;;
+    esac
+}
+
+#######################################
+# COLORS
+#######################################
+if [[ -t 1 ]]; then
+    COLOR_GREEN='\033[32m'
+    COLOR_GREEN_LIGHT='\033[1;32m'
+    COLOR_YELLOW='\033[33m'
+    COLOR_YELLOW_LIGHT='\033[1;33m'
+    COLOR_BLUE='\033[34m'
+    COLOR_RESET='\033[0m'
+else
+    COLOR_GREEN=""
+    COLOR_GREEN_LIGHT=""
+    COLOR_YELLOW=""
+    COLOR_YELLOW_LIGHT=""
+    COLOR_BLUE=""
+    COLOR_RESET=""
+fi
+
+#######################################
+# CREATE OUTPUT DIR
+#######################################
+mkdir -p "$OUTPUT_DIR" || { log_message ERROR "Error: cannot create output directory '$OUTPUT_DIR'"; exit 1; }
+total_files=$#
+processed=0
+CURRENT_OUTPUT=""
+
+#######################################
+# FUNCTIONS
+#######################################
+format_time() {
+    local sec=$1
+    local h=$((sec/3600))
+    local m=$(((sec%3600)/60))
+    local s=$((sec%60))
+    if ((h>0)); then
+        printf "%d:%02d:%02d" "$h" "$m" "$s"
+    else
+        printf "%d:%02d" "$m" "$s"
+    fi
+}
+
+calc_geometry() {
+    gawk -v W="$1" -v H="$2" -v ASPECT="$3" -v SCALE="$4" '
+    function even(x){return int(x/2)*2}
+    BEGIN{
+        cur=W/H
+        if(ASPECT=="source"){tgt=cur}else{split(ASPECT,a,":"); tgt=a[1]/a[2]}
+        if(cur>tgt){crop_h=H; crop_w=even(H*tgt); x=even((W-crop_w)/2); y=0}
+        else if(cur<tgt){crop_w=W; crop_h=even(W/tgt); x=0; y=even((H-crop_h)/2)}
+        else{crop_w=W; crop_h=H; x=y=0}
+        final_w=SCALE
+        final_h=even(crop_h*SCALE/crop_w)
+        printf "crop_w=%d crop_h=%d x=%d y=%d final_w=%d final_h=%d",crop_w,crop_h,x,y,final_w,final_h
+    }'
+}
+
+progress_bar() {
+    local current=$1
+    local total=$2
+    local speed=$3
+    local width=40
+    local percent filled bar_fill bar_spaces cur_time
+
+    # Avoid division by zero
+    if (( total == 0 )); then total=1; fi
+
+    percent=$(gawk -v c="$current" -v t="$total" 'BEGIN{printf "%.1f",(c/t)*100}')
+    filled=$(gawk -v c="$current" -v t="$total" -v w="$width" 'BEGIN{printf "%d",(c/t)*w}')
+    bar_fill=$(printf '%*s' "$filled" '' | tr ' ' '#')
+    bar_spaces=$(printf '%*s' "$((width-filled))" '' | tr ' ' '-')
+    cur_time=$(format_time "$current")
+
+    printf "\r[%b%s%b%b%s%b] %b%3d%%%b | %s | %-7s" \
+        "$COLOR_GREEN_LIGHT" "$bar_fill" "$COLOR_RESET" \
+        "$COLOR_BLUE" "$bar_spaces" "$COLOR_RESET" \
+        "$COLOR_YELLOW_LIGHT" "${percent%.*}" "$COLOR_RESET" \
+        "$cur_time" "$speed"
+}
+
+#######################################
+# PROCESS FILES
+#######################################
+process_one() {
+    local file="$1"
+
+    if [[ ! -f "$file" ]]; then
+        log_message ERROR "Error: file not found: $file"
+        $NOTIFY && notify-send -i dialog-error "File not found" "$(basename "$file")" -t 8000
+        return
+    fi
+
+    output="$OUTPUT_DIR/$(basename "$file")"
+
+    # Get original video resolution (first video stream)
+    size=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$file" 2>/dev/null | head -n1)
+    if [[ -z "$size" || "$size" == "N/A" ]]; then
+        log_message ERROR "Error: failed to read video resolution for: $file"
+        log_message ERROR "The file may be corrupted or not a valid video."
+        return
+    fi
+    width=${size%x*}
+    height=${size#*x}
+
+    # Get duration
+    duration_sec=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$file" 2>/dev/null)
+    duration_sec=${duration_sec%.*}
+    [[ -z "$duration_sec" || "$duration_sec" == "N/A" ]] && duration_sec=0
+    duration_formatted=$(format_time "$duration_sec")
+
+    # Calculate crop and scale parameters
+    local geometry_str
+    geometry_str=$(calc_geometry "$width" "$height" "$ASPECT" "$SCALE")
+    if [[ -z "$geometry_str" || "$geometry_str" != *"crop_w="* ]]; then
+        log_message ERROR "Error: failed to calculate geometry for: $file"
+        return
+    fi
+    eval "$geometry_str"
+    filter="crop=${crop_w}:${crop_h}:${x}:${y},scale=${final_w}:${final_h}"
+
+    echo
+    echo -e "======= ${COLOR_YELLOW_LIGHT}$(basename "$file") : ${width}x${height} : ${duration_formatted}${COLOR_RESET} ======="
+    echo "Filter: $filter → ${final_w}x${final_h}"
+    echo "Output: $output"
+
+    # Dry-run logic
+    if [[ "$DRY_RUN" == true ]]; then
+        if [[ -f "$output" ]]; then
+            log_message WARNING "WARNING: output file already exists"
+        fi
+        echo "Dry run: encoding skipped"
+        ((processed++))
+        return
+    fi
+
+    log_message INFO "Start processing $file, filter: $filter"
+
+    # Skip if output exists and not overwriting
+    if [[ -f "$output" && "$OVERWRITE" == false ]]; then
+        log_message WARNING "WARNING: output file already exists (use --overwrite to replace)"
+        return
+    else
+        log_message WARNING "WARNING: output file was overwrited"
+    fi
+
+    # Record current output file for cleanup on interruption
+    CURRENT_OUTPUT="$output"
+
+    # -------------------------------
+    # ffmpeg with progress bar
+    # -------------------------------
+    ffmpeg -nostdin -hide_banner -loglevel error \
+        -i "$file" \
+        -vf "$filter" \
+        -c:v libx265 -preset "$PRESET" -crf "$CRF" \
+        -c:a aac -b:a 128k \
+        -movflags +faststart \
+        -y "$output" \
+        -progress pipe:1 2>/dev/null | {
+            term_cols=$(tput cols 2>/dev/null || echo 70)
+            reserved=30
+            bar_width=$(( term_cols - reserved ))
+            (( bar_width < 30 )) && bar_width=30
+            (( bar_width > 70 )) && bar_width=70
+
+            speed="--.-x"
+            current_sec=0
+
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    out_time_ms)
+                        current_sec=$((value/1000000))
+                        (( current_sec > duration_sec )) && current_sec=$duration_sec
+                        progress_bar "$current_sec" "$duration_sec" "$speed"
+                        ;;
+                    speed)
+                        speed_val="${value# }"
+                        speed_val="${speed_val//[^0-9.]/}x"
+                        speed=$(printf "%-7s" "$speed_val")
+                        ;;
+                    progress)
+                        if [[ "$value" == "end" ]]; then
+                            full_bar=$(printf '%*s' "$bar_width" '' | tr ' ' '#')
+                            printf "\r[%b%s%b] 100%% | %s | %-7s\n" \
+                                "$COLOR_GREEN" "$full_bar" "$COLOR_RESET" "$duration_formatted" "$speed"
+                        fi
+                        ;;
+                esac
+            done
+        }
+    
+    CURRENT_OUTPUT=""
+
+    log_message INFO "Done: $output"
+    ((processed++))
+    $NOTIFY && notify-send -i video-x-generic "Video processed" "$(basename "$file")" -t 5000
+}
+
+# Process all files
+for file in "$@"; do
+    process_one "$file"
+done
+
+#######################################
+# FINAL SUMMARY
+#######################################
+echo
+log_message INFO "Processing complete. Successfully processed: $processed out of $total_files"
+$NOTIFY && {
+    if (( processed == total_files )); then
+        notify-send -i checkbox-checked "All files processed" "$processed out of $total_files" -t 15000
+    elif (( processed > 0 )); then
+        notify-send -i dialog-warning "Processing finished with errors" "Successfully processed: $processed out of $total_files" -t 15000
+    else
+        notify-send -i dialog-error "All files failed" "Successfully processed: 0 out of $total_files" -t 15000
+    fi
+}
+
+# Exit code:
+#   0 — at least one file was processed successfully
+#   1 — no files were processed (all failed or skipped)
+# This allows partial success in batch processing.
+if (( processed == 0 )); then
+    exit 1
+else
+    exit 0
+fi
