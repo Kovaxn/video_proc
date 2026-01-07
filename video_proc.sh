@@ -26,12 +26,10 @@ set -uo pipefail
 
 # Handle interruption (Ctrl+C) gracefully
 cleanup_on_exit() {
-    echo
-    log_message WARNING "DEBUG: CURRENT_OUTPUT='$CURRENT_OUTPUT'"
-    
     # Shutting down the proc to avoid recursion
     trap - SIGINT SIGTERM
 
+    echo
     # Time to ffmpeg correct exit on interrupt
     log_message WARNING "Processing interrupted. Waiting for ffmpeg to finish..."
     sleep 2
