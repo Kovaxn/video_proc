@@ -18,11 +18,13 @@
 #   ./video_proc.sh File\ 01{0..3}.mp4
 #######################################
 
+#--------------------------------------
 # Enable safer script execution:
 #   -u - treat unset variables as an error (prevents typos like $myvar vs $myvarr)
 #   -o - pipefail, make pipelines fail if any command in the pipe fails (not just the last one)
 # Note: -e (errexit) is intentionally omitted to allow partial success when processing multiple files
 set -uo pipefail
+#--------------------------------------
 
 # Handle interruption (Ctrl+C) gracefully
 cleanup_on_exit() {
