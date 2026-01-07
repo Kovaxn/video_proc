@@ -1,4 +1,5 @@
 # (Universal) video remastering script: crops video to center and scales to target width
+This script is a universal video remastering tool that crops and scales videos to a target width. It includes options for aspect ratio, scale, CRF quality, and more, while handling interruptions and logging.
 
 Usage: ```./video_proc.sh file1.mp4 file2.mp4 "File 014.1.mp4" ...```
 
