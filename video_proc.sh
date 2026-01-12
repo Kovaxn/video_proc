@@ -57,7 +57,7 @@ trap cleanup_on_exit SIGINT SIGTERM
 #######################################
 # DEFAULT PARAMETERS
 #######################################
-VERSION="1.0"
+VERSION="1.1"
 ASPECT="source"
 SCALE=960
 CRF=28
@@ -74,6 +74,8 @@ LOG_FILE=""
 #######################################
 show_help() {
     cat <<EOF
+Script version $VERSION
+
 Usage: $0 [OPTIONS] input1.mp4 [input2.mp4 ...]
 
 Options:
