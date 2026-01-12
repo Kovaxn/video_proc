@@ -180,7 +180,7 @@ log_message() {
     fi
 
     case "$level" in
-        ERROR|WARNING)
+        ERROR|WARNING|WARN)
             echo "$msg" >&2
             ;;
         *)
@@ -229,6 +229,25 @@ format_time() {
     else
         printf "%d:%02d" "$m" "$s"
     fi
+}
+
+format_number() {
+    local num="$1"
+    if [[ ! "$num" =~ ^[0-9]+$ ]]; then
+        echo "0"
+        return
+    fi
+    echo "$num" | gawk '{
+        n = length($0)
+        result = ""
+        for (i = n; i >= 1; i--) {
+            result = substr($0, i, 1) result
+            if ((n - i + 1) % 3 == 0 && i > 1) {
+                result = " " result
+            }
+        }
+        print result
+    }'
 }
 
 calc_geometry() {
@@ -281,6 +300,15 @@ process_one() {
         return
     fi
 
+    # Get input file size
+    # stat -f%z — for macOS/BSD
+    # stat -c%s — for Linux
+    input_size_bytes=0
+    if [[ -f "$file" ]]; then
+        input_size_bytes=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo 0)
+    fi
+    input_size_formatted=$(format_number "$input_size_bytes")
+
     output="$OUTPUT_DIR/$(basename "$file")"
 
     # Get original video resolution (first video stream)
@@ -311,27 +339,28 @@ process_one() {
 
     echo
     echo -e "======= ${COLOR_YELLOW_LIGHT}$(basename "$file") : ${width}x${height} : ${duration_formatted}${COLOR_RESET} ======="
+    echo -e "Original size (bytes): ${COLOR_GREEN_LIGHT}${input_size_formatted}${COLOR_RESET}"
     echo "Filter: $filter → ${final_w}x${final_h}"
     echo "Output: $output"
 
     # Dry-run logic
     if [[ "$DRY_RUN" == true ]]; then
         if [[ -f "$output" ]]; then
-            log_message WARNING "WARNING: output file already exists"
+            log_message WARN "WARNING: output file already exists"
         fi
         echo "Dry run: encoding skipped"
         ((processed++))
         return
     fi
 
-    log_message INFO "Start processing $file, filter: $filter"
+    log_message INFO "Start processing $file, filter: $filter, size: ${input_size_bytes}b"
 
     # Skip if output exists and not overwriting
     if [[ -f "$output" && "$OVERWRITE" == false ]]; then
-        log_message WARNING "WARNING: output file already exists (use --overwrite to replace)"
+        log_message WARN "WARNING: output file already exists (use --overwrite to replace)"
         return
     else
-        log_message WARNING "WARNING: output file was overwrited"
+        log_message WARN "WARNING: output file was overwritten"
     fi
 
     # Record current output file for cleanup on interruption
@@ -383,6 +412,25 @@ process_one() {
     CURRENT_OUTPUT=""
 
     log_message INFO "Done: $output"
+
+    if [[ "$DRY_RUN" == false ]]; then
+        # Get output file size
+        output_size_bytes=0
+        if [[ -f "$output" ]]; then
+            output_size_bytes=$(stat -f%z "$output" 2>/dev/null || stat -c%s "$output" 2>/dev/null || echo 0)
+        fi
+        output_size_formatted=$(format_number "$output_size_bytes")
+
+        # Calculate compression ratio (avoid division by zero)
+        compression_ratio="N/A"
+        if (( input_size_bytes > 0 && output_size_bytes > 0 )); then
+            # Use awk for floating-point division
+            compression_ratio=$(awk "BEGIN {printf \"%.2fx\", $input_size_bytes / $output_size_bytes}")
+        fi
+        echo -e "Output size (bytes): ${COLOR_GREEN_LIGHT}${output_size_formatted}${COLOR_RESET}"
+        log_message INFO "Size (bytes): ${input_size_bytes} -> ${output_size_bytes}, compression: $compression_ratio"
+    fi
+
     ((processed++))
     $NOTIFY && notify-send -i video-x-generic "Video processed" "$(basename "$file")" -t 5000
 }
