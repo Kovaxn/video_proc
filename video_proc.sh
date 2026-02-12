@@ -57,7 +57,7 @@ trap cleanup_on_exit SIGINT SIGTERM
 #######################################
 # DEFAULT PARAMETERS
 #######################################
-VERSION="1.2"
+VERSION="1.3"
 ASPECT="source"
 SCALE=960
 SCALE_MODE="auto"
@@ -320,7 +320,7 @@ format_number() {
 }
 
 calc_geometry() {
-    gawk -v W="$1" -v H="$2" -v ASPECT="$3" -v SCALE="$4" -v SCALE_MODE="$5" '
+    gawk -v W="$1" -v H="$2" -v ASPECT="$3" -v SCALE="$4" -v SCALE_MODE="$5" -v ORIENTATION="$6" '
     function even(x){return int(x/2)*2}
     BEGIN{
         cur=W/H
@@ -332,10 +332,10 @@ calc_geometry() {
         # Determine which dimension to scale
         if(SCALE_MODE=="auto"){
             # Auto: width for horizontal/square, height for vertical
-            if(crop_w >= crop_h){
-                scale_by="width"
+            if (ORIENTATION == "horizontal") {
+                scale_by = "width"
             } else {
-                scale_by="height"
+                scale_by = "height"
             }
         } else if(SCALE_MODE=="width"){
             scale_by="width"
@@ -426,34 +426,62 @@ process_one() {
     width=${size%x*}
     height=${size#*x}
 
+    # Get rotation metadata (for mobile videos)
+    rotation=$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=rotate -of default=nw=1:nk=1 "$file" 2>/dev/null)
+    # Also check side_data_list for displaymatrix rotation
+    if [[ -z "$rotation" ]]; then
+        rotation=$(ffprobe -v error -select_streams v:0 -show_entries side_data=rotation -of default=nw=1:nk=1 "$file" 2>/dev/null)
+    fi
+
+    effective_width="$width"
+    effective_height="$height"
+
+    if [[ "$rotation" == "90" || "$rotation" == "270" || \
+          "$rotation" == "-90" || "$rotation" == "-270" ]]; then
+        effective_width="$height"
+        effective_height="$width"
+    fi
+
     # Get duration
     duration_sec=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$file" 2>/dev/null)
     duration_sec=${duration_sec%.*}
     [[ -z "$duration_sec" || "$duration_sec" == "N/A" ]] && duration_sec=0
     duration_formatted=$(format_time "$duration_sec")
 
-    # Determine video orientation
+    # Determine video orientation (after accounting for rotation)
     local orientation="horizontal"
-    if (( width < height )); then
+    if (( effective_width < effective_height )); then
         orientation="vertical"
-    elif (( width == height )); then
+    elif (( effective_width == effective_height )); then
         orientation="square"
     fi
 
     # Calculate crop and scale parameters
     local geometry_str
-    geometry_str=$(calc_geometry "$width" "$height" "$ASPECT" "$SCALE" "$SCALE_MODE")
+    geometry_str=$(calc_geometry \
+        "$effective_width" \
+        "$effective_height" \
+        "$ASPECT" \
+        "$SCALE" \
+        "$SCALE_MODE" \
+        "$orientation")
     if [[ -z "$geometry_str" || "$geometry_str" != *"crop_w="* ]]; then
         log_message ERROR "Error: failed to calculate geometry for: $file"
         return
     fi
     eval "$geometry_str"
-    filter="crop=${crop_w}:${crop_h}:${x}:${y},scale=${final_w}:${final_h}"
+
+    # Build filter chain with rotation handling
+    local filter_chain=""
+    filter_chain="crop=${crop_w}:${crop_h}:${x}:${y},scale=${final_w}:${final_h}"
 
     echo
     echo -e "======= ${COLOR_YELLOW_LIGHT}$(basename "$file") : ${width}x${height} ($orientation) : ${duration_formatted}${COLOR_RESET} ======="
+    if [[ -n "$rotation" && "$rotation" != "0" ]]; then
+        echo -e "${COLOR_GREEN_LIGHT}Rotation metadata: ${rotation}°${COLOR_RESET}"
+    fi
     echo -e "Original size (bytes): ${COLOR_GREEN_LIGHT}${input_size_formatted}${COLOR_RESET}"
-    echo "Filter: $filter → ${final_w}x${final_h} (scaled by $scale_by)"
+    echo "Filter: $filter_chain → ${final_w}x${final_h} (scaled by $scale_by)"
     echo "Output: $output"
 
     # Dry-run logic
@@ -466,7 +494,7 @@ process_one() {
         return
     fi
 
-    log_message INFO "Start processing $file, filter: $filter, size: ${input_size_bytes}b, orientation: $orientation, scaled by: $scale_by"
+    log_message INFO "Start processing $file, filter: $filter_chain, size: ${input_size_bytes}b, orientation: $orientation, rotation: ${rotation:-0}°, scaled by: $scale_by"
 
     # Skip if output exists and not overwriting
     if [[ -f "$output" && "$OVERWRITE" == false ]]; then
@@ -484,7 +512,8 @@ process_one() {
     # -------------------------------
     ffmpeg -nostdin -hide_banner -loglevel error \
         -i "$file" \
-        -vf "$filter" \
+        -vf "$filter_chain" \
+        -metadata:s:v:0 rotate=0 \
         -c:v libx265 -preset "$PRESET" -crf "$CRF" \
         -c:a aac -b:a 128k \
         -movflags +faststart \
