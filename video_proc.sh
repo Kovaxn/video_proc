@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# (Universal) video remastering script: crops video to center and scales to target width
+# (Universal) video remastering script: crops video to center and scales to target width or height
 # Source: https://github.com/Kovaxn/video_proc/
 #
 # Usage: ./video_proc.sh file1.mp4 file2.mp4 "File 014.1.mp4" ...
@@ -57,9 +57,10 @@ trap cleanup_on_exit SIGINT SIGTERM
 #######################################
 # DEFAULT PARAMETERS
 #######################################
-VERSION="1.1"
+VERSION="1.2"
 ASPECT="source"
 SCALE=960
+SCALE_MODE="auto"
 CRF=28
 PRESET="slow"
 NOTIFY=true
@@ -80,7 +81,14 @@ Usage: $0 [OPTIONS] input1.mp4 [input2.mp4 ...]
 
 Options:
   --aspect RATIO      Target aspect ratio (e.g. 4:3, 16:9). Default: source
-  --scale WIDTH       Target output width. Height is calculated proportionally. Default: 960
+  --scale VALUE       Target output dimension (width or height, see --scale-mode). Default: 960
+  --scale-mode MODE   How to apply --scale value:
+                        auto   - smart detection (width for horizontal, height for vertical)
+                        width  - always scale by width (original behavior)
+                        height - always scale by height
+                        long   - scale by longer side
+                        short  - scale by shorter side
+                      Default: auto
   --crf VALUE         CRF quality (H.265). Lower = better quality. Default: 28
   --preset NAME       x265 preset (ultrafast, fast, medium, slow, veryslow). Default: slow
   --notify            Enable desktop notifications (default)
@@ -96,6 +104,8 @@ Examples:
   $0 File*.mp4
   $0 --aspect 4:3 --scale 720 "File 010.mp4" "File 011.mp4"
   $0 --no-notify --overwrite File_010.mp4
+  $0 --scale-mode height --scale 1280 vertical_video.mp4
+  $0 --scale-mode long --scale 1920 mixed_videos*.mp4
 EOF
     exit 0
 }
@@ -124,14 +134,27 @@ POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help) show_help ;;
-        --aspect) ASPECT="$2"; shift 2 ;;
-        --scale) SCALE="$2"; shift 2 ;;
-        --crf) CRF="$2"; shift 2 ;;
-        --preset) PRESET="$2"; shift 2 ;;
+        --aspect)
+            [[ $# -lt 2 ]] && { echo "Error: --aspect requires a value" >&2; exit 1; }
+            ASPECT="$2"; shift 2 ;;
+        --scale)
+            [[ $# -lt 2 ]] && { echo "Error: --scale requires a value" >&2; exit 1; }
+            SCALE="$2"; shift 2 ;;
+        --scale-mode)
+            [[ $# -lt 2 ]] && { echo "Error: --scale-mode requires a value" >&2; exit 1; }
+            SCALE_MODE="$2"; shift 2 ;;
+        --crf)
+            [[ $# -lt 2 ]] && { echo "Error: --crf requires a value" >&2; exit 1; }
+            CRF="$2"; shift 2 ;;
+        --preset)
+            [[ $# -lt 2 ]] && { echo "Error: --preset requires a value" >&2; exit 1; }
+            PRESET="$2"; shift 2 ;;
         --notify) NOTIFY=true; shift ;;
         --no-notify) NOTIFY=false; shift ;;
         --overwrite) OVERWRITE=true; shift ;;
-        --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --output-dir)
+            [[ $# -lt 2 ]] && { echo "Error: --output-dir requires a value" >&2; exit 1; }
+            OUTPUT_DIR="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         --log)
             if [[ $# -gt 1 && "$2" != --* ]]; then
@@ -151,6 +174,7 @@ while [[ $# -gt 0 ]]; do
         *) POSITIONAL+=("$1"); shift ;;
     esac
 done
+
 set -- "${POSITIONAL[@]}"
 
 if [[ $# -eq 0 ]]; then
@@ -158,6 +182,49 @@ if [[ $# -eq 0 ]]; then
     echo "Use --help for usage instructions" >&2
     exit 1
 fi
+
+#######################################
+# ARGUMENT VALIDATION
+#######################################
+# Validate --aspect: source | W:H
+if [[ "$ASPECT" != "source" ]]; then
+    if [[ ! "$ASPECT" =~ ^[0-9]+:[0-9]+$ ]]; then
+        echo "Error: invalid aspect ratio '$ASPECT'. Expected 'source' or W:H (e.g. 16:9)" >&2
+        exit 1
+    fi
+fi
+
+# Validate --scale: positive integer
+if [[ ! "$SCALE" =~ ^[0-9]+$ || "$SCALE" -le 0 ]]; then
+    echo "Error: --scale must be a positive integer (got '$SCALE')" >&2
+    exit 1
+fi
+
+# Validate --scale-mode
+case "$SCALE_MODE" in
+    auto|width|height|long|short) ;;
+    *)
+        echo "Error: invalid --scale-mode value: $SCALE_MODE" >&2
+        echo "Valid values: auto, width, height, long, short" >&2
+        exit 1
+        ;;
+esac
+
+# Validate --crf: 0-51
+if [[ ! "$CRF" =~ ^[0-9]+$ ]] || (( CRF < 0 || CRF > 51 )); then
+    echo "Error: --crf must be an integer between 0 and 51 (got '$CRF')" >&2
+    exit 1
+fi
+
+# Validate --preset
+case "$PRESET" in
+    ultrafast|superfast|veryfast|faster|fast|medium|slow|slower|veryslow|placebo) ;;
+    *)
+        echo "Error: invalid --preset value: $PRESET" >&2
+        echo "Valid values: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo" >&2
+        exit 1
+        ;;
+esac
 
 #######################################
 # CHECK NOTIFY
@@ -253,7 +320,7 @@ format_number() {
 }
 
 calc_geometry() {
-    gawk -v W="$1" -v H="$2" -v ASPECT="$3" -v SCALE="$4" '
+    gawk -v W="$1" -v H="$2" -v ASPECT="$3" -v SCALE="$4" -v SCALE_MODE="$5" '
     function even(x){return int(x/2)*2}
     BEGIN{
         cur=W/H
@@ -261,9 +328,45 @@ calc_geometry() {
         if(cur>tgt){crop_h=H; crop_w=even(H*tgt); x=even((W-crop_w)/2); y=0}
         else if(cur<tgt){crop_w=W; crop_h=even(W/tgt); x=0; y=even((H-crop_h)/2)}
         else{crop_w=W; crop_h=H; x=y=0}
-        final_w=SCALE
-        final_h=even(crop_h*SCALE/crop_w)
-        printf "crop_w=%d crop_h=%d x=%d y=%d final_w=%d final_h=%d",crop_w,crop_h,x,y,final_w,final_h
+
+        # Determine which dimension to scale
+        if(SCALE_MODE=="auto"){
+            # Auto: width for horizontal/square, height for vertical
+            if(crop_w >= crop_h){
+                scale_by="width"
+            } else {
+                scale_by="height"
+            }
+        } else if(SCALE_MODE=="width"){
+            scale_by="width"
+        } else if(SCALE_MODE=="height"){
+            scale_by="height"
+        } else if(SCALE_MODE=="long"){
+            # Long: scale by longer side
+            if(crop_w >= crop_h){
+                scale_by="width"
+            } else {
+                scale_by="height"
+            }
+        } else if(SCALE_MODE=="short"){
+            # Short: scale by shorter side
+            if(crop_w <= crop_h){
+                scale_by="width"
+            } else {
+                scale_by="height"
+            }
+        }
+
+        # Calculate final dimensions
+        if(scale_by=="width"){
+            final_w=SCALE
+            final_h=even(crop_h*SCALE/crop_w)
+        } else {
+            final_h=SCALE
+            final_w=even(crop_w*SCALE/crop_h)
+        }
+
+        printf "crop_w=%d crop_h=%d x=%d y=%d final_w=%d final_h=%d scale_by=%s",crop_w,crop_h,x,y,final_w,final_h,scale_by
     }'
 }
 
@@ -329,9 +432,17 @@ process_one() {
     [[ -z "$duration_sec" || "$duration_sec" == "N/A" ]] && duration_sec=0
     duration_formatted=$(format_time "$duration_sec")
 
+    # Determine video orientation
+    local orientation="horizontal"
+    if (( width < height )); then
+        orientation="vertical"
+    elif (( width == height )); then
+        orientation="square"
+    fi
+
     # Calculate crop and scale parameters
     local geometry_str
-    geometry_str=$(calc_geometry "$width" "$height" "$ASPECT" "$SCALE")
+    geometry_str=$(calc_geometry "$width" "$height" "$ASPECT" "$SCALE" "$SCALE_MODE")
     if [[ -z "$geometry_str" || "$geometry_str" != *"crop_w="* ]]; then
         log_message ERROR "Error: failed to calculate geometry for: $file"
         return
@@ -340,9 +451,9 @@ process_one() {
     filter="crop=${crop_w}:${crop_h}:${x}:${y},scale=${final_w}:${final_h}"
 
     echo
-    echo -e "======= ${COLOR_YELLOW_LIGHT}$(basename "$file") : ${width}x${height} : ${duration_formatted}${COLOR_RESET} ======="
+    echo -e "======= ${COLOR_YELLOW_LIGHT}$(basename "$file") : ${width}x${height} ($orientation) : ${duration_formatted}${COLOR_RESET} ======="
     echo -e "Original size (bytes): ${COLOR_GREEN_LIGHT}${input_size_formatted}${COLOR_RESET}"
-    echo "Filter: $filter → ${final_w}x${final_h}"
+    echo "Filter: $filter → ${final_w}x${final_h} (scaled by $scale_by)"
     echo "Output: $output"
 
     # Dry-run logic
@@ -355,13 +466,13 @@ process_one() {
         return
     fi
 
-    log_message INFO "Start processing $file, filter: $filter, size: ${input_size_bytes}b"
+    log_message INFO "Start processing $file, filter: $filter, size: ${input_size_bytes}b, orientation: $orientation, scaled by: $scale_by"
 
     # Skip if output exists and not overwriting
     if [[ -f "$output" && "$OVERWRITE" == false ]]; then
         log_message WARN "WARNING: output file already exists (use --overwrite to replace)"
         return
-    else
+    elif [[ -f "$output" && "$OVERWRITE" == true ]]; then
         log_message WARN "WARNING: output file was overwritten"
     fi
 
@@ -410,7 +521,7 @@ process_one() {
                 esac
             done
         }
-    
+
     CURRENT_OUTPUT=""
 
     log_message INFO "Done: $output"
