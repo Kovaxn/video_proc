@@ -57,7 +57,7 @@ trap cleanup_on_exit SIGINT SIGTERM
 #######################################
 # DEFAULT PARAMETERS
 #######################################
-VERSION="1.3"
+VERSION="1.4"
 ASPECT="source"
 SCALE=960
 SCALE_MODE="auto"
@@ -417,7 +417,7 @@ process_one() {
     output="$OUTPUT_DIR/$(basename "$file")"
 
     # Get original video resolution (first video stream)
-    size=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$file" 2>/dev/null | head -n1)
+    size=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$file" 2>/dev/null < /dev/null | head -n1)
     if [[ -z "$size" || "$size" == "N/A" ]]; then
         log_message ERROR "Error: failed to read video resolution for: $file"
         log_message ERROR "The file may be corrupted or not a valid video."
@@ -427,11 +427,9 @@ process_one() {
     height=${size#*x}
 
     # Get rotation metadata (for mobile videos)
-    rotation=$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=rotate -of default=nw=1:nk=1 "$file" 2>/dev/null)
-    # Also check side_data_list for displaymatrix rotation
-    if [[ -z "$rotation" ]]; then
-        rotation=$(ffprobe -v error -select_streams v:0 -show_entries side_data=rotation -of default=nw=1:nk=1 "$file" 2>/dev/null)
-    fi
+    rotation=$(ffprobe -v error -select_streams v:0 -show_entries stream_tags=rotate -of default=nw=1:nk=1 "$file" 2>/dev/null < /dev/null)
+    # Note: Checking side_data=rotation causes ffprobe to process all frames which can hang on long videos
+    # If stream_tags=rotate is empty, we assume no rotation
 
     effective_width="$width"
     effective_height="$height"
@@ -443,7 +441,7 @@ process_one() {
     fi
 
     # Get duration
-    duration_sec=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$file" 2>/dev/null)
+    duration_sec=$(ffprobe -v error -show_entries format=duration -of default=nk=1:nw=1 "$file" 2>/dev/null < /dev/null)
     duration_sec=${duration_sec%.*}
     [[ -z "$duration_sec" || "$duration_sec" == "N/A" ]] && duration_sec=0
     duration_formatted=$(format_time "$duration_sec")
