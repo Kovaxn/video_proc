@@ -57,7 +57,7 @@ trap cleanup_on_exit SIGINT SIGTERM
 #######################################
 # DEFAULT PARAMETERS
 #######################################
-VERSION="1.4"
+VERSION="1.5"
 ASPECT="source"
 SCALE=960
 SCALE_MODE="auto"
@@ -67,6 +67,7 @@ NOTIFY=true
 OVERWRITE=false
 OUTPUT_DIR="_remaster"
 DRY_RUN=false
+APPEND_SIZE=false
 SCRIPT_NAME="${0##*/}"
 LOG_FILE=""
 
@@ -96,6 +97,7 @@ Options:
   --overwrite         Overwrite output files if they exist
   --output-dir DIR    Directory to save processed files. Default: _remaster
   --dry-run           Only calculate filter parameters, do not encode
+  --append-size       Append output resolution to filename (e.g. M001.mp4 → M001_640x480.mp4)
   --log [FILE]        Enable logging. If FILE is not provided, auto-generates a log file in current directory.
   --version           Show version and exit
   --help              Show this help message and exit
@@ -156,6 +158,7 @@ while [[ $# -gt 0 ]]; do
             [[ $# -lt 2 ]] && { echo "Error: --output-dir requires a value" >&2; exit 1; }
             OUTPUT_DIR="$2"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --append-size) APPEND_SIZE=true; shift ;;
         --log)
             if [[ $# -gt 1 && "$2" != --* ]]; then
                 LOG_FILE="$2"
@@ -414,9 +417,7 @@ process_one() {
     fi
     input_size_formatted=$(format_number "$input_size_bytes")
 
-    output="$OUTPUT_DIR/$(basename "$file")"
 
-    # Get original video resolution (first video stream)
     size=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x "$file" 2>/dev/null < /dev/null | head -n1)
     if [[ -z "$size" || "$size" == "N/A" ]]; then
         log_message ERROR "Error: failed to read video resolution for: $file"
@@ -468,6 +469,20 @@ process_one() {
         return
     fi
     eval "$geometry_str"
+
+    # Build output path (optionally appending output resolution to filename)
+    local base ext name
+    base=$(basename "$file")
+    ext="${base##*.}"
+    name="${base%.*}"
+    if [[ "$APPEND_SIZE" == true ]]; then
+        # Strip existing _WxH suffix (if any), then append actual output resolution
+        local clean_name
+        clean_name=$(echo "$name" | sed 's/_[0-9]\+x[0-9]\+$//')
+        output="$OUTPUT_DIR/${clean_name}_${final_w}x${final_h}.${ext}"
+    else
+        output="$OUTPUT_DIR/$base"
+    fi
 
     # Build filter chain with rotation handling
     local filter_chain=""
